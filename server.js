@@ -3,17 +3,46 @@ const mysql = require('mysql2/promise');
 const cors = require('cors'); 
 const bcrypt = require('bcryptjs');
 const SibApiV3Sdk = require('sib-api-v3-sdk');
+const jwt = require('jsonwebtoken'); // Added for unique policy links
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
-// --- Brevo Setup ---
+// --- 1. BREVO (SMS & EMAIL) SETUP ---
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 const apiKey = defaultClient.authentications['api-key'];
-apiKey.apiKey = 'YOUR_BREVO_V3_KEY'; // Replace with your key
+apiKey.apiKey = process.env.BREVO_API_KEY || 'YOUR_BREVO_V3_KEY';
 
+const sendSMS = async (phone, message) => {
+    const apiInstance = new SibApiV3Sdk.TransactionalSMSApi();
+    const sendTransacSms = new SibApiV3Sdk.SendTransacSms();
+    sendTransacSms.sender = "LesediLife";
+    sendTransacSms.recipient = phone;
+    sendTransacSms.content = message;
+    try { await apiInstance.sendTransacSms(sendTransacSms); } 
+    catch (error) { console.error("SMS Error:", error.message); }
+};
+
+// ADDED: Email Logic for Admin and Partners
+const sendEmail = async (to, subject, htmlContent) => {
+    const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+    const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+    sendSmtpEmail.subject = subject;
+    sendSmtpEmail.htmlContent = htmlContent;
+    sendSmtpEmail.sender = { name: "Lesedi Life", email: "noreply@lesedilife.com" };
+    sendSmtpEmail.to = [{ email: to }];
+    try { await apiInstance.sendTransacEmail(sendSmtpEmail); }
+    catch (error) { console.error("Email Error:", error.message); }
+};
+
+// --- 2. DATABASE CONNECTION ---
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
@@ -22,6 +51,19 @@ const pool = mysql.createPool({
     port: 4000,
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true }
 });
+
+// --- 3. PAY@ API PLACEHOLDER ---
+// This handles the monthly premium payments from customers to the insurance company
+app.post('/api/payat/callback', async (req, res) => {
+    const { reference, amount, status } = req.body;
+    // logic: If status is success, update policy 'last_payment_date'
+    console.log(`Pay@ Payment Received: ${reference} - R${amount}`);
+    res.status(200).send("OK");
+});
+
+// ==========================================
+// ROUTES
+// ==========================================
 
 // SIGNUP
 app.post('/api/signup', async (req, res) => {
@@ -32,6 +74,8 @@ app.post('/api/signup', async (req, res) => {
             'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
             [email, hashedPassword, plan]
         );
+        // Notify Admin via Email that a new FSP has signed up
+        await sendEmail("admin@lesedilife.com", "New Registration", `User ${email} is awaiting approval.`);
         res.status(201).json({ success: true, userId: result.insertId });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -39,40 +83,65 @@ app.post('/api/signup', async (req, res) => {
 // LOGIN
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
-    if (email === 'admin' && password === 'admin') return res.json({ id: 0, role: 'admin' });
+    if (email === 'admin' && password === 'admin') {
+        return res.json({ id: 0, role: 'admin', email: 'admin' });
+    }
     try {
         const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
-        if (rows.length === 0) return res.status(401).json({ error: "Not found" });
-        if (!rows[0].is_approved) return res.status(403).json({ error: "Awaiting Admin Approval" });
-        const valid = await bcrypt.compare(password, rows[0].password);
+        if (rows.length === 0) return res.status(401).json({ error: "User not found" });
+        const user = rows[0];
+        if (!user.is_approved) return res.status(403).json({ error: "Awaiting Admin approval" });
+        const valid = await bcrypt.compare(password, user.password);
         if (!valid) return res.status(401).json({ error: "Invalid password" });
-        res.json({ id: rows[0].id, role: 'partner', email: rows[0].email });
+
+        // Generate a unique link for this client to give to THEIR customers
+        const clientToken = jwt.sign({ clientId: user.id }, 'SECRET_KEY_123');
+        const uniqueLink = `https://lesedi-life-portal.netlify.app/public-create?ref=${clientToken}`;
+
+        res.json({ id: user.id, role: 'partner', email: user.email, uniqueLink: uniqueLink });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POLICY ACTIONS (Create, Delete, Status Toggle)
+// ADMIN: PENDING & APPROVE
+app.get('/api/admin/pending', async (req, res) => {
+    const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
+    res.json(rows);
+});
+
+app.post('/api/admin/approve', async (req, res) => {
+    const { user_id } = req.body;
+    await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [user_id]);
+    res.json({ success: true });
+});
+
+// CREATE POLICY (Partner creating for customer)
 app.post('/api/policies', async (req, res) => {
-    const { company_id, insurance_type, h_name, h_id, h_cell, h_addr, b_name, b_id, b_rel } = req.body;
-    const policyNum = "POL-" + Math.random().toString(36).substr(2, 9).toUpperCase();
+    const { company_id, h_name, h_id, h_cell, h_addr, b_name, b_id, b_rel, insurance_type } = req.body;
+    const policyNum = "LP" + Math.floor(100000 + Math.random() * 900000); // More professional policy number
+
     try {
         await pool.execute(
-            `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, beneficiary_name, beneficiary_id, beneficiary_relation) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [company_id, policyNum, insurance_type, h_name, h_id, h_cell, h_addr, b_name, b_id, b_rel]
+            `INSERT INTO policies (company_id, policy_number, holder_name, holder_id, holder_cell, holder_address, beneficiary_name, beneficiary_id, beneficiary_relation, insurance_type, status) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
+            [company_id, policyNum, h_name, h_id, h_cell, h_addr, b_name, b_id, b_rel, insurance_type]
         );
+
+        // SMS to Customer
+        await sendSMS(h_cell, `Lesedi Life: Your policy ${policyNum} is active. Beneficiary: ${b_name}.`);
+        
         res.json({ success: true, policyNumber: policyNum });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET POLICIES
 app.get('/api/policies', async (req, res) => {
-    const { company_id } = req.query;
-    const [rows] = await pool.execute('SELECT * FROM policies WHERE company_id = ?', [company_id]);
+    const [rows] = await pool.execute('SELECT * FROM policies WHERE company_id = ?', [req.query.company_id]);
     res.json(rows);
 });
 
-app.post('/api/policies/status', async (req, res) => {
-    const { id, status } = req.body;
-    await pool.execute('UPDATE policies SET status = ? WHERE id = ?', [status, id]);
+// DELETE & STATUS
+app.put('/api/policies/:id/status', async (req, res) => {
+    await pool.execute('UPDATE policies SET status = ? WHERE id = ?', [req.body.status, req.params.id]);
     res.json({ success: true });
 });
 
@@ -81,15 +150,5 @@ app.delete('/api/policies/:id', async (req, res) => {
     res.json({ success: true });
 });
 
-// ADMIN ROUTES
-app.get('/api/admin/pending', async (req, res) => {
-    const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
-    res.json(rows);
-});
-
-app.post('/api/admin/approve', async (req, res) => {
-    await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [req.body.user_id]);
-    res.json({ success: true });
-});
-
-app.listen(3000, () => console.log('Server Running on Port 3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
