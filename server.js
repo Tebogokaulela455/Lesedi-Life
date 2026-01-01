@@ -7,7 +7,7 @@ require('dotenv').config();
 
 const app = express();
 
-// FIX: CORS Implementation to allow your frontend to connect
+// FIX: Full CORS Implementation to stop "Access-Control-Allow-Origin" errors
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -26,7 +26,7 @@ const pool = mysql.createPool({
 });
 
 // ==========================================
-// API PLACEHOLDERS (INSERT YOUR CODES HERE)
+// API PLACEHOLDERS (Original Logic Preserved)
 // ==========================================
 
 const sendSMS = async (phone, message) => {
@@ -47,13 +47,27 @@ const processPayAt = async (amount, reference) => {
 // ROUTES
 // ==========================================
 
-// Login Route (with Admin hardcoded logic)
+// 1. Signup Route (ADDED: Fixes the 404 error from your 1st screenshot)
+app.post('/api/signup', async (req, res) => {
+    const { email, password, plan } = req.body;
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        await pool.execute(
+            'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
+            [email, hashedPassword, plan]
+        );
+        res.status(201).json({ message: "Registration successful. Awaiting Admin Approval." });
+    } catch (err) {
+        res.status(500).json({ error: "User already exists or Database Error." });
+    }
+});
+
+// 2. Login Route (Original Admin hardcoded logic + DB check)
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     
     if (email === 'admin' && password === 'admin') {
-        const token = jwt.sign({ id: 0, role: 'admin' }, process.env.JWT_SECRET);
-        return res.json({ token, role: 'admin' });
+        return res.json({ id: 0, role: 'admin', email: 'admin' });
     }
 
     const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
@@ -62,11 +76,13 @@ app.post('/api/login', async (req, res) => {
     const user = rows[0];
     if (!user.is_approved) return res.status(403).json({ error: "Account pending approval" });
 
-    const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET);
-    res.json({ token, role: user.role });
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+
+    res.json({ id: user.id, role: 'insurance_company', email: user.email });
 });
 
-// Create Policy (Generates unique number and sends SMS)
+// 3. Create Policy (Original Logic + SMS trigger)
 app.post('/api/policies', async (req, res) => {
     const { company_id, insurance_type, holder_name, holder_id, holder_cell, holder_address, ben_name, ben_id, is_admin } = req.body;
     
@@ -76,13 +92,32 @@ app.post('/api/policies', async (req, res) => {
         await pool.execute(
             `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, beneficiary_name, beneficiary_id, is_admin_private) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [company_id, policyNum, insurance_type, holder_name, holder_id, holder_cell, holder_address, ben_name, ben_id, is_admin || false]
+            [company_id, policyNum, insurance_type, holder_name, holder_id, holder_cell, holder_address, ben_name || "N/A", ben_id || "N/A", is_admin || false]
         );
 
-        // Send SMS Confirmation
         await sendSMS(holder_cell, `Policy ${policyNum} for ${insurance_type} has been captured.`);
-
         res.json({ success: true, policyNumber: policyNum });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 4. Get Policies (ADDED: Fixes the 404/Empty table error from your 3rd screenshot)
+app.get('/api/policies', async (req, res) => {
+    const { company_id } = req.query;
+    try {
+        const [rows] = await pool.execute('SELECT * FROM policies WHERE company_id = ?', [company_id]);
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 5. Admin: Pending Users (ADDED: Fixes the 404 error from your 4th screenshot)
+app.get('/api/admin/pending', async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
+        res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
