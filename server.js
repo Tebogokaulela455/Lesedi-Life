@@ -3,11 +3,12 @@ const mysql = require('mysql2/promise');
 const cors = require('cors'); 
 const bcrypt = require('bcryptjs');
 const SibApiV3Sdk = require('sib-api-v3-sdk');
-const jwt = require('jsonwebtoken'); // Added for unique policy links
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
 
+// 1. FULL CORS (Fixes all connection errors)
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -15,10 +16,10 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// --- 1. BREVO (SMS & EMAIL) SETUP ---
+// 2. BREVO (SMS & EMAIL) SETUP
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 const apiKey = defaultClient.authentications['api-key'];
-apiKey.apiKey = process.env.BREVO_API_KEY || 'YOUR_BREVO_V3_KEY';
+apiKey.apiKey = 'YOUR_BREVO_V3_KEY'; // REPLACE THIS
 
 const sendSMS = async (phone, message) => {
     const apiInstance = new SibApiV3Sdk.TransactionalSMSApi();
@@ -26,23 +27,20 @@ const sendSMS = async (phone, message) => {
     sendTransacSms.sender = "LesediLife";
     sendTransacSms.recipient = phone;
     sendTransacSms.content = message;
-    try { await apiInstance.sendTransacSms(sendTransacSms); } 
-    catch (error) { console.error("SMS Error:", error.message); }
+    try { await apiInstance.sendTransacSms(sendTransacSms); } catch (e) { console.error("SMS Error"); }
 };
 
-// ADDED: Email Logic for Admin and Partners
-const sendEmail = async (to, subject, htmlContent) => {
+const sendEmail = async (to, subject, content) => {
     const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
     const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
     sendSmtpEmail.subject = subject;
-    sendSmtpEmail.htmlContent = htmlContent;
-    sendSmtpEmail.sender = { name: "Lesedi Life", email: "noreply@lesedilife.com" };
+    sendSmtpEmail.htmlContent = content;
+    sendSmtpEmail.sender = { name: "Lesedi Life", email: "admin@lesedilife.com" };
     sendSmtpEmail.to = [{ email: to }];
-    try { await apiInstance.sendTransacEmail(sendSmtpEmail); }
-    catch (error) { console.error("Email Error:", error.message); }
+    try { await apiInstance.sendTransacEmail(sendSmtpEmail); } catch (e) { console.error("Email Error"); }
 };
 
-// --- 2. DATABASE CONNECTION ---
+// 3. DATABASE CONNECTION
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
@@ -52,102 +50,92 @@ const pool = mysql.createPool({
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true }
 });
 
-// --- 3. PAY@ API PLACEHOLDER ---
-// This handles the monthly premium payments from customers to the insurance company
-app.post('/api/payat/callback', async (req, res) => {
-    const { reference, amount, status } = req.body;
-    // logic: If status is success, update policy 'last_payment_date'
-    console.log(`Pay@ Payment Received: ${reference} - R${amount}`);
-    res.status(200).send("OK");
-});
-
 // ==========================================
-// ROUTES
+// ALL ROUTES (LEAVING NOTHING OUT)
 // ==========================================
 
-// SIGNUP
+// SIGNUP: Save user and notify admin
 app.post('/api/signup', async (req, res) => {
     const { email, password, plan } = req.body;
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
-        const [result] = await pool.execute(
+        await pool.execute(
             'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
             [email, hashedPassword, plan]
         );
-        // Notify Admin via Email that a new FSP has signed up
-        await sendEmail("admin@lesedilife.com", "New Registration", `User ${email} is awaiting approval.`);
-        res.status(201).json({ success: true, userId: result.insertId });
+        await sendEmail("admin@lesedilife.com", "New FSP Signup", `User ${email} signed up for plan R${plan}`);
+        res.status(201).json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// LOGIN
+// LOGIN: Handle Admin and Partners + Generate unique links
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
-    if (email === 'admin' && password === 'admin') {
-        return res.json({ id: 0, role: 'admin', email: 'admin' });
-    }
-    try {
-        const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
-        if (rows.length === 0) return res.status(401).json({ error: "User not found" });
-        const user = rows[0];
-        if (!user.is_approved) return res.status(403).json({ error: "Awaiting Admin approval" });
-        const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: "Invalid password" });
+    if (email === 'admin' && password === 'admin') return res.json({ id: 0, role: 'admin' });
 
-        // Generate a unique link for this client to give to THEIR customers
-        const clientToken = jwt.sign({ clientId: user.id }, 'SECRET_KEY_123');
-        const uniqueLink = `https://lesedi-life-portal.netlify.app/public-create?ref=${clientToken}`;
+    const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
+    if (rows.length === 0) return res.status(401).json({ error: "User not found" });
 
-        res.json({ id: user.id, role: 'partner', email: user.email, uniqueLink: uniqueLink });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    const user = rows[0];
+    if (!user.is_approved) return res.status(403).json({ error: "Awaiting Admin Approval" });
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ error: "Invalid password" });
+
+    // Unique link for this client's customers
+    const uniqueLink = `https://monumental-malasada-0ba635.netlify.app/public-signup?ref=${user.id}`;
+    res.json({ id: user.id, role: 'partner', uniqueLink });
 });
 
-// ADMIN: PENDING & APPROVE
+// ADMIN: GET PENDING USERS
 app.get('/api/admin/pending', async (req, res) => {
     const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
     res.json(rows);
 });
 
+// ADMIN: APPROVE USER
 app.post('/api/admin/approve', async (req, res) => {
-    const { user_id } = req.body;
-    await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [user_id]);
+    await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [req.body.user_id]);
     res.json({ success: true });
 });
 
-// CREATE POLICY (Partner creating for customer)
+// POLICIES: CREATE (With SMS trigger)
 app.post('/api/policies', async (req, res) => {
     const { company_id, h_name, h_id, h_cell, h_addr, b_name, b_id, b_rel, insurance_type } = req.body;
-    const policyNum = "LP" + Math.floor(100000 + Math.random() * 900000); // More professional policy number
-
+    const policyNum = "LP-" + Math.floor(100000 + Math.random() * 900000);
     try {
         await pool.execute(
             `INSERT INTO policies (company_id, policy_number, holder_name, holder_id, holder_cell, holder_address, beneficiary_name, beneficiary_id, beneficiary_relation, insurance_type, status) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`,
-            [company_id, policyNum, h_name, h_id, h_cell, h_addr, b_name, b_id, b_rel, insurance_type]
+            [company_id, policyNum, h_name, h_id, h_cell, h_addr, b_name, b_id, b_rel, insurance_type || 'Funeral Cover']
         );
-
-        // SMS to Customer
-        await sendSMS(h_cell, `Lesedi Life: Your policy ${policyNum} is active. Beneficiary: ${b_name}.`);
-        
+        await sendSMS(h_cell, `Lesedi Life: Your policy ${policyNum} is active.`);
         res.json({ success: true, policyNumber: policyNum });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET POLICIES
+// POLICIES: GET ALL FOR COMPANY
 app.get('/api/policies', async (req, res) => {
     const [rows] = await pool.execute('SELECT * FROM policies WHERE company_id = ?', [req.query.company_id]);
     res.json(rows);
 });
 
-// DELETE & STATUS
+// POLICIES: STATUS UPDATE (Deactivate/Reactivate)
 app.put('/api/policies/:id/status', async (req, res) => {
     await pool.execute('UPDATE policies SET status = ? WHERE id = ?', [req.body.status, req.params.id]);
     res.json({ success: true });
 });
 
+// POLICIES: DELETE
 app.delete('/api/policies/:id', async (req, res) => {
     await pool.execute('DELETE FROM policies WHERE id = ?', [req.params.id]);
     res.json({ success: true });
+});
+
+// PAY@ PLACEHOLDER (Premium Payments)
+app.post('/api/payat-callback', async (req, res) => {
+    console.log("Pay@ Payment Received", req.body);
+    res.sendStatus(200);
 });
 
 const PORT = process.env.PORT || 3000;
