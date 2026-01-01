@@ -4,20 +4,37 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
 const SibApiV3Sdk = require('sib-api-v3-sdk');
 require('dotenv').config();
 
 const app = express();
 
-// Fixes: net::ERR_CONNECTION_TIMED_OUT and CORS policy blocked errors
+// 1. FULL CORS IMPLEMENTATION
+// Fixes net::ERR_CONNECTION_TIMED_OUT and 400 errors from your logs
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
 app.use(express.json());
+
+// 2. FILE UPLOAD CONFIGURATION
+// Create uploads folder if it doesn't exist
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir);
+}
 app.use('/uploads', express.static('uploads'));
 
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, 'uploads/'),
+    filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
+});
+const upload = multer({ storage });
+
+// 3. DATABASE POOL
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
@@ -27,22 +44,15 @@ const pool = mysql.createPool({
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true }
 });
 
-// Brevo (SMS/Email) Setup
+// 4. BREVO (Transactional SMS) SETUP
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 const apiKey = defaultClient.authentications['api-key'];
 apiKey.apiKey = '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';
 const apiInstanceSMS = new SibApiV3Sdk.TransactionalSMSApi();
 
-// File Upload Logic for Deactivating Policies via Death Certificates
-const storage = multer.diskStorage({
-    destination: './uploads/',
-    filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
-});
-const upload = multer({ storage });
+// --- API ROUTES ---
 
-// --- ROUTES ---
-
-// Signup Route: Fixed to prevent 500 errors
+// SIGNUP: Saves user as 'pending' (is_approved = 0) before PayFast redirect
 app.post('/api/signup', async (req, res) => {
     const { email, password, plan } = req.body;
     try {
@@ -51,63 +61,105 @@ app.post('/api/signup', async (req, res) => {
             'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
             [email, hashedPassword, plan]
         );
-        res.status(201).json({ message: "Registration successful. Pay to continue." });
+        res.status(201).json({ message: "User registered. Proceeding to payment." });
     } catch (err) {
-        res.status(500).json({ error: "Email exists or database error." });
+        res.status(500).json({ error: "Email already exists or Database Error." });
     }
 });
 
-// Login: Fixed Admin 'admin/admin' bypass
+// LOGIN: Handles Admin 'admin/admin' and regular companies
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
+    
     if (email === 'admin' && password === 'admin') {
         return res.json({ id: 0, role: 'admin', email: 'admin' });
     }
+
     try {
         const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
         if (rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+
         const user = rows[0];
-        if (!user.is_approved) return res.status(403).json({ error: "Pending Admin approval." });
+        if (!user.is_approved) return res.status(403).json({ error: "Account pending admin approval" });
+
         const valid = await bcrypt.compare(password, user.password);
         if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+
         res.json({ id: user.id, role: 'company', email: user.email });
-    } catch (e) { res.status(500).json({ error: "Server login error" }); }
+    } catch (err) {
+        res.status(500).json({ error: "Server login error" });
+    }
 });
 
-// Create Policy: Generates unique numbers and sends SMS
+// CREATE POLICY: Generates unique numbers and sends SMS via Brevo
 app.post('/api/policies', async (req, res) => {
     const { company_id, type, name, id_num, cell, addr } = req.body;
-    const policyNum = "LL-" + Math.floor(100000 + Math.random() * 899999);
+    const policyNum = "LL-" + Math.floor(100000 + Math.random() * 900000);
+
     try {
         await pool.execute(
             `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, status) 
             VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
             [company_id, policyNum, type, name, id_num, cell, addr]
         );
-        // Trigger SMS via Brevo API
-        await apiInstanceSMS.sendTransacSms({ "sender": "LesediLife", "recipient": cell, "content": `Policy ${policyNum} is active.` });
+
+        // Trigger SMS notification
+        await apiInstanceSMS.sendTransacSms({ 
+            "sender": "LesediLife", 
+            "recipient": cell, 
+            "content": `Lesedi Life: Your unique policy ${policyNum} is now active.` 
+        });
+
         res.json({ success: true, policyNumber: policyNum });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Admin & User: View Active Policies
+// GET POLICIES: Fetches based on Role
 app.get('/api/policies', async (req, res) => {
     const { company_id, role } = req.query;
-    // Admin (ID 0) sees EVERYTHING, Companies see only their own
-    const sql = (role === 'admin') ? 'SELECT * FROM policies WHERE status = "active"' : 'SELECT * FROM policies WHERE company_id = ? AND status = "active"';
-    const params = (role === 'admin') ? [] : [company_id];
-    const [rows] = await pool.execute(sql, params);
-    res.json(rows);
+    try {
+        const sql = (role === 'admin') 
+            ? 'SELECT * FROM policies WHERE status = "active"' 
+            : 'SELECT * FROM policies WHERE company_id = ? AND status = "active"';
+        const params = (role === 'admin') ? [] : [company_id];
+        
+        const [rows] = await pool.execute(sql, params);
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: "Failed to load policies" });
+    }
 });
 
-// Deactivate Policy (Admin Feature)
+// DEACTIVATE POLICY: Updates status and stores Death Certificate Path
 app.post('/api/policies/deactivate', upload.single('certificate'), async (req, res) => {
     const { policyId } = req.body;
     const filePath = req.file ? req.file.path : null;
+
     try {
-        await pool.execute('UPDATE policies SET status = "inactive", death_cert_path = ? WHERE id = ?', [filePath, policyId]);
+        await pool.execute(
+            'UPDATE policies SET status = "inactive", death_cert_path = ? WHERE id = ?', 
+            [filePath, policyId]
+        );
         res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: "Deactivation failed" }); }
+    } catch (err) {
+        res.status(500).json({ error: "Deactivation failed" });
+    }
 });
 
-app.listen(3000, () => console.log('Server running on port 3000'));
+// ADMIN: List pending users
+app.get('/api/admin/pending', async (req, res) => {
+    const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
+    res.json(rows);
+});
+
+// ADMIN: Approve user
+app.post('/api/admin/approve', async (req, res) => {
+    const { userId } = req.body;
+    await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [userId]);
+    res.json({ success: true });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
