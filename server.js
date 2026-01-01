@@ -25,30 +25,46 @@ const pool = mysql.createPool({
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true }
 });
 
-// API PLACEHOLDERS
-const sendSMS = async (phone, message) => { console.log(`[SMS] ${phone}: ${message}`); };
-const sendEmail = async (email, subject, body) => { console.log(`[Email] ${email}`); };
+// ==========================================
+// API PLACEHOLDERS (Original Logic Preserved)
+// ==========================================
+
+const sendSMS = async (phone, message) => {
+    // --- INSERT SMS API CODE HERE ---
+    console.log(`[SMS API] To ${phone}: ${message}`);
+};
+
+const sendEmail = async (email, subject, body) => {
+    // --- INSERT EMAIL API CODE HERE ---
+    console.log(`[Email API] To ${email}`);
+};
+
+const processPayAt = async (amount, reference) => {
+    // --- INSERT Pay@ API CODE HERE ---
+};
 
 // ==========================================
 // ROUTES
 // ==========================================
 
-// 1. SIGNUP ROUTE (Fixes 404 on Register)
+// 1. SIGNUP ROUTE (Fixes 500 error - handles new user registration)
 app.post('/api/signup', async (req, res) => {
     const { email, password, plan } = req.body;
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
+        // Important: ensure 'plan_type' and 'is_approved' columns exist in your TiDB
         await pool.execute(
             'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
             [email, hashedPassword, plan]
         );
         res.status(201).json({ message: "Registration successful. Awaiting Admin Approval." });
     } catch (err) {
-        res.status(500).json({ error: "Email already exists or Database Error." });
+        console.error(err);
+        res.status(500).json({ error: "Database error during signup: " + err.message });
     }
 });
 
-// 2. LOGIN ROUTE
+// 2. LOGIN ROUTE (Original Admin + DB Logic)
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     if (email === 'admin' && password === 'admin') {
@@ -65,30 +81,45 @@ app.post('/api/login', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE POLICY
+// 3. CREATE POLICY (Original Logic + generates number)
 app.post('/api/policies', async (req, res) => {
-    const { company_id, insurance_type, holder_name, holder_id, holder_cell, holder_address } = req.body;
+    const { company_id, insurance_type, holder_name, holder_id, holder_cell, holder_address, ben_name, ben_id, is_admin } = req.body;
     const policyNum = "POL-" + Math.random().toString(36).substr(2, 9).toUpperCase();
     try {
         await pool.execute(
-            `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [company_id, policyNum, insurance_type, holder_name, holder_id, holder_cell, holder_address]
+            `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, beneficiary_name, beneficiary_id, is_admin_private) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [company_id, policyNum, insurance_type, holder_name, holder_id, holder_cell, holder_address, ben_name || "N/A", ben_id || "N/A", is_admin || false]
         );
+        await sendSMS(holder_cell, `Policy ${policyNum} for ${insurance_type} has been captured.`);
         res.json({ success: true, policyNumber: policyNum });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADMIN: GET PENDING (Fixes Admin 404)
+// 4. GET POLICIES (Fixes "My Policies" loading error)
+app.get('/api/policies', async (req, res) => {
+    const { company_id } = req.query;
+    try {
+        const [rows] = await pool.execute('SELECT * FROM policies WHERE company_id = ?', [company_id]);
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 5. ADMIN: GET PENDING (Fixes Admin Approvals 404)
 app.get('/api/admin/pending', async (req, res) => {
-    const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
-    res.json(rows);
+    try {
+        const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. ADMIN: APPROVE
+// 6. ADMIN: APPROVE USER
 app.post('/api/admin/approve', async (req, res) => {
-    await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [req.body.user_id]);
-    res.json({ success: true });
+    const { user_id } = req.body;
+    try {
+        await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [user_id]);
+        res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.listen(3000, () => console.log('Server running on 3000'));
+app.listen(3000, () => console.log('Server running on port 3000'));
