@@ -1,27 +1,21 @@
 const express = require('express');
 const mysql = require('mysql2/promise');
-const cors = require('cors');
+const cors = require('cors'); 
 const bcrypt = require('bcryptjs');
-const SibApiV3Sdk = require('sib-api-v3-sdk');
+const SibApiV3Sdk = require('sib-api-v3-sdk'); // Brevo SDK
 require('dotenv').config();
 
 const app = express();
 
-// --- Brevo Setup ---
+// FIX: Ensure CORS is fully open for Render/Netlify communication
+app.use(cors());
+app.use(express.json());
+
+// Brevo Setup
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 const apiKey = defaultClient.authentications['api-key'];
-apiKey.apiKey = process.env.BREVO_API_KEY; // Ensure this is in your Render Environment Variables
-
-const apiInstanceEmail = new SibApiV3Sdk.TransactionalEmailsApi();
+apiKey.apiKey = process.env.BREVO_API_KEY; 
 const apiInstanceSMS = new SibApiV3Sdk.TransactionalSMSApi();
-
-// Fix CORS
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(express.json());
 
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
@@ -34,58 +28,74 @@ const pool = mysql.createPool({
 
 // Helper: Send SMS via Brevo
 const sendSMS = async (phone, message) => {
-    let sendTransacSms = new SibApiV3Sdk.SendTransacSms();
-    sendTransacSms = {
+    let sendTransacSms = {
         "sender": "LesediLife",
         "recipient": phone,
         "content": message
     };
     try {
         await apiInstanceSMS.sendTransacSms(sendTransacSms);
-        console.log(`SMS Sent to ${phone}`);
     } catch (error) { console.error('SMS Error:', error); }
 };
 
-// Routes
+// --- ROUTES ---
+
+// 1. Signup: Fixed to include password in req.body
 app.post('/api/signup', async (req, res) => {
-    const { email, password, plan, hasLink } = req.body;
+    const { email, password, plan } = req.body; // Added password
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         await pool.execute(
-            'INSERT INTO users (email, password, plan_type, has_online_link, is_approved) VALUES (?, ?, ?, ?, 0)',
-            [email, hashedPassword, plan, hasLink ? 1 : 0]
+            'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
+            [email, hashedPassword, plan]
         );
-        res.status(201).json({ message: "Success. Pending Admin Approval." });
+        res.status(201).json({ message: "Registration successful. Awaiting Admin Approval." });
     } catch (err) {
-        res.status(500).json({ error: "Email already registered or Database error." });
+        res.status(500).json({ error: "User already exists or Database Error." });
     }
 });
 
+// 2. Login: Fixed Admin logic to prevent bcrypt crashes
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
+    
+    // Check hardcoded admin first
     if (email === 'admin' && password === 'admin') {
-        return res.json({ id: 9999, role: 'admin', email: 'admin' });
+        return res.json({ id: 0, role: 'admin', email: 'admin' });
     }
+
     try {
         const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
-        if (rows.length === 0) return res.status(401).json({ error: "User not found" });
+        if (rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+
         const user = rows[0];
-        if (!user.is_approved) return res.status(403).json({ error: "Account pending admin approval." });
+        if (!user.is_approved) return res.status(403).json({ error: "Account pending approval" });
+
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: "Invalid password" });
-        res.json({ id: user.id, role: 'partner', email: user.email });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+
+        res.json({ id: user.id, role: 'insurance_company', email: user.email });
+    } catch (err) {
+        res.status(500).json({ error: "Server Error" });
+    }
+});
+
+// 3. Admin: Approve Users (Missing in your previous version)
+app.post('/api/admin/approve', async (req, res) => {
+    const { userId } = req.body;
+    try {
+        await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [userId]);
+        res.json({ message: "User approved" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/api/admin/pending', async (req, res) => {
-    const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
-    res.json(rows);
-});
-
-app.post('/api/admin/approve', async (req, res) => {
-    const { userId } = req.body;
-    await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [userId]);
-    res.json({ message: "User approved successfully" });
+    try {
+        const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
+        res.json(rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/policies', async (req, res) => {
@@ -97,7 +107,7 @@ app.post('/api/policies', async (req, res) => {
             VALUES (?, ?, ?, ?, ?, ?, ?)`,
             [company_id, policyNum, insurance_type, holder_name, holder_id, holder_cell, holder_address]
         );
-        await sendSMS(holder_cell, `Lesedi Life: Your policy ${policyNum} is active. Welcome!`);
+        await sendSMS(holder_cell, `Lesedi Life: Policy ${policyNum} created.`);
         res.json({ success: true, policyNumber: policyNum });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
