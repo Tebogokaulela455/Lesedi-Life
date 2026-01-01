@@ -5,9 +5,14 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
+// --- Brevo (Sendinblue) SDK Initialization ---
+const SibApiV3Sdk = require('sib-api-v3-sdk');
+const defaultClient = SibApiV3Sdk.ApiClient.instance;
+const apiKey = defaultClient.authentications['api-key'];
+apiKey.apiKey = 'YOUR_BREVO_V3_API_KEY'; // Replace with your key
+
 const app = express();
 
-// FIX: Full CORS Implementation to stop "Access-Control-Allow-Origin" errors
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -26,86 +31,111 @@ const pool = mysql.createPool({
 });
 
 // ==========================================
-// API PLACEHOLDERS (Original Logic Preserved)
+// BREVO API LOGIC (Email & SMS)
 // ==========================================
 
 const sendSMS = async (phone, message) => {
-    // --- INSERT SMS API CODE HERE ---
-    console.log(`[SMS API] To ${phone}: ${message}`);
+    const apiInstance = new SibApiV3Sdk.TransactionalSMSApi();
+    const sendTransacSms = new SibApiV3Sdk.SendTransacSms();
+    sendTransacSms.sender = "LesediLife";
+    sendTransacSms.recipient = phone;
+    sendTransacSms.content = message;
+
+    try {
+        await apiInstance.sendTransacSms(sendTransacSms);
+        console.log(`SMS sent successfully to ${phone}`);
+    } catch (error) {
+        console.error("Brevo SMS Error:", error.response ? error.response.text : error.message);
+    }
 };
 
-const sendEmail = async (email, subject, body) => {
-    // --- INSERT EMAIL API CODE HERE ---
-    console.log(`[Email API] To ${email}`);
-};
+const sendEmail = async (email, subject, htmlBody) => {
+    const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+    const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+    
+    sendSmtpEmail.subject = subject;
+    sendSmtpEmail.htmlContent = htmlBody;
+    sendSmtpEmail.sender = { name: "Lesedi Life", email: "noreply@lesedilife.com" };
+    sendSmtpEmail.to = [{ email: email }];
 
-const processPayAt = async (amount, reference) => {
-    // --- INSERT Pay@ API CODE HERE ---
+    try {
+        await apiInstance.sendTransacEmail(sendSmtpEmail);
+        console.log(`Email sent successfully to ${email}`);
+    } catch (error) {
+        console.error("Brevo Email Error:", error.response ? error.response.text : error.message);
+    }
 };
 
 // ==========================================
-// ROUTES
+// ROUTES (Fixed 404, 500, and 400 errors)
 // ==========================================
 
-// 1. SIGNUP ROUTE (Fixes 500 error - handles new user registration)
+// 1. Signup Route (Fixes 500 Error by logging exact DB issues)
 app.post('/api/signup', async (req, res) => {
     const { email, password, plan } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Missing email or password" });
+
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
-        // Important: ensure 'plan_type' and 'is_approved' columns exist in your TiDB
-        await pool.execute(
+        const [result] = await pool.execute(
             'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
             [email, hashedPassword, plan]
         );
-        res.status(201).json({ message: "Registration successful. Awaiting Admin Approval." });
+
+        // Notify user via Brevo
+        await sendEmail(email, "Welcome to Lesedi Life", "<h1>Registration Received</h1><p>Please complete your payment to activate your account.</p>");
+
+        res.status(201).json({ success: true, userId: result.insertId });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Database error during signup: " + err.message });
+        console.error("Signup Database Error:", err.message);
+        res.status(500).json({ error: "Database error: " + err.message });
     }
 });
 
-// 2. LOGIN ROUTE (Original Admin + DB Logic)
+// 2. Login Route
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
+    
     if (email === 'admin' && password === 'admin') {
         return res.json({ id: 0, role: 'admin', email: 'admin' });
     }
+
     try {
         const [rows] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
-        if (rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+        if (rows.length === 0) return res.status(401).json({ error: "User not found" });
+
         const user = rows[0];
         if (!user.is_approved) return res.status(403).json({ error: "Account pending approval" });
+
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+        if (!valid) return res.status(401).json({ error: "Invalid password" });
+
         res.json({ id: user.id, role: 'partner', email: user.email });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// 3. CREATE POLICY (Original Logic + generates number)
+// 3. Policy Creation (Generates number and sends Brevo SMS)
 app.post('/api/policies', async (req, res) => {
-    const { company_id, insurance_type, holder_name, holder_id, holder_cell, holder_address, ben_name, ben_id, is_admin } = req.body;
+    const { company_id, insurance_type, holder_name, holder_id, holder_cell, holder_address } = req.body;
     const policyNum = "POL-" + Math.random().toString(36).substr(2, 9).toUpperCase();
+
     try {
         await pool.execute(
-            `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, beneficiary_name, beneficiary_id, is_admin_private) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [company_id, policyNum, insurance_type, holder_name, holder_id, holder_cell, holder_address, ben_name || "N/A", ben_id || "N/A", is_admin || false]
+            `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [company_id, policyNum, insurance_type, holder_name, holder_id, holder_cell, holder_address]
         );
-        await sendSMS(holder_cell, `Policy ${policyNum} for ${insurance_type} has been captured.`);
+
+        await sendSMS(holder_cell, `Hello ${holder_name}, your policy ${policyNum} for ${insurance_type} is active.`);
         res.json({ success: true, policyNumber: policyNum });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// 4. GET POLICIES (Fixes "My Policies" loading error)
-app.get('/api/policies', async (req, res) => {
-    const { company_id } = req.query;
-    try {
-        const [rows] = await pool.execute('SELECT * FROM policies WHERE company_id = ?', [company_id]);
-        res.json(rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// 5. ADMIN: GET PENDING (Fixes Admin Approvals 404)
+// 4. Admin: View Pending Users
 app.get('/api/admin/pending', async (req, res) => {
     try {
         const [rows] = await pool.execute('SELECT id, email, plan_type FROM users WHERE is_approved = 0');
@@ -113,13 +143,12 @@ app.get('/api/admin/pending', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 6. ADMIN: APPROVE USER
+// 5. Admin: Approve User
 app.post('/api/admin/approve', async (req, res) => {
-    const { user_id } = req.body;
     try {
-        await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [user_id]);
+        await pool.execute('UPDATE users SET is_approved = 1 WHERE id = ?', [req.body.user_id]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.listen(3000, () => console.log('Server running on port 3000'));
+app.listen(3000, () => console.log('Server live on port 3000'));
