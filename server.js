@@ -28,7 +28,7 @@ const pool = mysql.createPool({
 
 // --- Brevo (Sendinblue) Configuration ---
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
-const apiKey = defaultClient.authentications['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'];
+const apiKey = defaultClient.authentications['API Key'];
 apiKey.apiKey = process.env.BREVO_API_KEY; // Add your API key to Render Environment Variables
 
 const apiInstanceSMS = new SibApiV3Sdk.TransactionalSMSApi();
