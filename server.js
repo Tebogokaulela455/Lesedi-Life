@@ -40,10 +40,14 @@ const pool = mysql.createPool({
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true }
 });
 
+
+
+
 // 4. BREVO SMS SETUP
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 const apiKey = defaultClient.authentications['api-key'];
-apiKey.apiKey = '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';
+// Use the variable from your .env/Render settings
+apiKey.apiKey = process.env.BREVO_API_KEY; 
 const apiInstanceSMS = new SibApiV3Sdk.TransactionalSMSApi();
 
 // --- ROUTES ---
