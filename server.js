@@ -100,7 +100,7 @@ app.post('/api/login', async (req, res) => {
     } catch (e) { res.status(500).json({ error: "Login error" }); }
 });
 
-// UPDATED WITH SAFETY BLOCK AND BENEFICIARY FIELDS
+// UPDATED WITH SAFETY BLOCK, BENEFICIARY FIELDS, AND AUTH FIX
 app.post('/api/policies', async (req, res) => {
     const { company_id, type, name, id_num, cell, addr, b_name, b_id, b_cell } = req.body;
     const policyNum = "LL-" + Math.floor(100000 + Math.random() * 900000);
@@ -114,11 +114,17 @@ app.post('/api/policies', async (req, res) => {
 
         // 2. THE SAFETY BLOCK: Try SMS but don't crash if it fails
         try {
+            // Re-enforce API Key immediately before call to fix "Unauthorized" errors
+            const defaultClient = SibApiV3Sdk.ApiClient.instance;
+            const apiKey = defaultClient.authentications['api-key'];
+            apiKey.apiKey = process.env.BREVO_API_KEY; 
+
             await apiInstanceSMS.sendTransacSms({ 
                 "sender": "LesediLife", 
-                "recipient": cell, 
+                "recipient": cell.replace(/\s+/g, ''), // Clean spaces from phone number
                 "content": `Policy ${policyNum} is active for ${name}. Beneficiary: ${b_name}.` 
             });
+            console.log("SMS sent successfully to " + cell);
         } catch (smsError) {
             console.error("SMS Failed but Policy was saved:", smsError.message);
         }
