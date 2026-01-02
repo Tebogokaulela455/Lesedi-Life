@@ -40,19 +40,14 @@ const pool = mysql.createPool({
     ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true }
 });
 
-
-
-
 // 4. BREVO SMS SETUP
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 const apiKey = defaultClient.authentications['api-key'];
-// Use the variable from your .env/Render settings
 apiKey.apiKey = process.env.BREVO_API_KEY; 
 const apiInstanceSMS = new SibApiV3Sdk.TransactionalSMSApi();
 
 // --- ROUTES ---
 
-// NEW DATABASE DOCTOR ROUTE (Added for troubleshooting)
 app.get('/api/debug-db', async (req, res) => {
     try {
         const [rows] = await pool.execute('SELECT 1 + 1 AS result');
@@ -70,8 +65,7 @@ app.get('/api/debug-db', async (req, res) => {
         res.status(500).json({ 
             success: false, 
             message: "DATABASE CONNECTION FAILED", 
-            error: err.message,
-            hint: "Check your Render Environment Variables and TiDB IP Whitelist." 
+            error: err.message
         });
     }
 });
@@ -106,18 +100,33 @@ app.post('/api/login', async (req, res) => {
     } catch (e) { res.status(500).json({ error: "Login error" }); }
 });
 
+// UPDATED WITH SAFETY BLOCK AND BENEFICIARY FIELDS
 app.post('/api/policies', async (req, res) => {
-    const { company_id, type, name, id_num, cell, addr } = req.body;
+    const { company_id, type, name, id_num, cell, addr, b_name, b_id, b_cell } = req.body;
     const policyNum = "LL-" + Math.floor(100000 + Math.random() * 900000);
     try {
+        // 1. Save to Database first
         await pool.execute(
-            `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
-            [company_id, policyNum, type, name, id_num, cell, addr]
+            `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, beneficiary_name, beneficiary_id, beneficiary_cell, status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+            [company_id, policyNum, type, name, id_num, cell, addr, b_name, b_id, b_cell]
         );
-        await apiInstanceSMS.sendTransacSms({ "sender": "LesediLife", "recipient": cell, "content": `Policy ${policyNum} is active.` });
+
+        // 2. THE SAFETY BLOCK: Try SMS but don't crash if it fails
+        try {
+            await apiInstanceSMS.sendTransacSms({ 
+                "sender": "LesediLife", 
+                "recipient": cell, 
+                "content": `Policy ${policyNum} is active for ${name}. Beneficiary: ${b_name}.` 
+            });
+        } catch (smsError) {
+            console.error("SMS Failed but Policy was saved:", smsError.message);
+        }
+
         res.json({ success: true, policyNumber: policyNum });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { 
+        res.status(500).json({ error: e.message }); 
+    }
 });
 
 app.get('/api/policies', async (req, res) => {
@@ -150,7 +159,6 @@ app.post('/api/admin/approve', async (req, res) => {
     res.json({ success: true });
 });
 
-// ERROR HANDLERS
 app.use((err, req, res, next) => {
     console.error(err.stack);
     res.status(500).json({ error: "Internal Server Error", message: err.message });
