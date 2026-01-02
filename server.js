@@ -48,11 +48,34 @@ const apiInstanceSMS = new SibApiV3Sdk.TransactionalSMSApi();
 
 // --- ROUTES ---
 
+// NEW DATABASE DOCTOR ROUTE (Added for troubleshooting)
+app.get('/api/debug-db', async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT 1 + 1 AS result');
+        res.json({ 
+            success: true, 
+            message: "DATABASE IS CONNECTED!", 
+            testResult: rows[0].result,
+            config: {
+                host: process.env.DB_HOST ? "Defined" : "MISSING",
+                user: process.env.DB_USER ? "Defined" : "MISSING",
+                db: process.env.DB_NAME ? "Defined" : "MISSING"
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ 
+            success: false, 
+            message: "DATABASE CONNECTION FAILED", 
+            error: err.message,
+            hint: "Check your Render Environment Variables and TiDB IP Whitelist." 
+        });
+    }
+});
+
 app.post('/api/signup', async (req, res) => {
     const { email, password, plan } = req.body;
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
-        // Matching your new SQL: email, password, plan_type, is_approved
         await pool.execute(
             'INSERT INTO users (email, password, plan_type, is_approved) VALUES (?, ?, ?, 0)',
             [email, hashedPassword, plan]
@@ -83,7 +106,6 @@ app.post('/api/policies', async (req, res) => {
     const { company_id, type, name, id_num, cell, addr } = req.body;
     const policyNum = "LL-" + Math.floor(100000 + Math.random() * 900000);
     try {
-        // Matching your new SQL columns: company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, status
         await pool.execute(
             `INSERT INTO policies (company_id, policy_number, insurance_type, holder_name, holder_id, holder_cell, holder_address, status) 
             VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
@@ -108,7 +130,6 @@ app.post('/api/policies/deactivate', upload.single('certificate'), async (req, r
     const { policyId } = req.body;
     const filePath = req.file ? req.file.path : null;
     try {
-        // Matching your new SQL column: death_cert_path
         await pool.execute('UPDATE policies SET status = "inactive", death_cert_path = ? WHERE id = ?', [filePath, policyId]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: "Deactivation failed" }); }
@@ -125,14 +146,12 @@ app.post('/api/admin/approve', async (req, res) => {
     res.json({ success: true });
 });
 
-
-// Add this at the end of server.js to prevent HTML error responses
+// ERROR HANDLERS
 app.use((err, req, res, next) => {
     console.error(err.stack);
     res.status(500).json({ error: "Internal Server Error", message: err.message });
 });
 
-// Ensure any 404s also return JSON instead of HTML
 app.use((req, res) => {
     res.status(404).json({ error: "Route not found" });
 });
